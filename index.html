@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AsiaX Admin Dashboard</title>
+
+  <!-- Bootstrap (mobile friendly) -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+
+  <!-- ethers v5 -->
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+
+  <style>
+    body { background: #f4f6f8; }
+    .card { border-radius: 14px; box-shadow: 0 6px 18px rgba(0,0,0,0.06); }
+    .small-muted { font-size:0.85rem; color:#6c757d; }
+    .status-ok { color: green; font-weight: 600; }
+    .status-bad { color: #d9534f; font-weight: 600; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", monospace; }
+  </style>
+</head>
+<body>
+  <div class="container py-3">
+    <div class="text-center mb-3">
+      <h4>.</h4>
+      <p class="small-muted">.</p>
+    </div>
+
+    <div class="d-grid gap-2 mb-3">
+      <button id="connectBtn" class="btn btn-primary">🔗 Connect Wallet</button>
+      <button id="refreshBtn" class="btn btn-outline-secondary" style="display:none;">🔄 Refresh Data</button>
+    </div>
+
+    <!-- Warning / Info -->
+    <div id="infoBox" style="display:none;" class="alert alert-info p-2"></div>
+
+    <!-- Dashboard -->
+    <div id="dashboard" style="display:none;">
+      <div class="row gx-2 gy-3">
+        <div class="col-6">
+          <div class="card p-3 text-center">
+            <div class="small-muted">Total Users</div>
+            <div class="h5" id="totalUsers">—</div>
+          </div>
+        </div>
+        <div class="col-6">
+          <div class="card p-3 text-center">
+            <div class="small-muted">Contract Balance</div>
+            <div class="h5 mono" id="contractBalance">— AX</div>
+          </div>
+        </div>
+
+        <div class="col-6">
+          <div class="card p-3 text-center">
+            <div class="small-muted">Daily Liability</div>
+            <div class="h6 mono" id="dailyLiability">— AX / day</div>
+          </div>
+        </div>
+        <div class="col-6">
+          <div class="card p-3 text-center">
+            <div class="small-muted">Sustainability</div>
+            <div class="h6 mono" id="sustainDays">— Days</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Projection -->
+      <div class="card mt-3 p-3">
+        <h6>⏳ Projection (No new users)</h6>
+        <div class="small-muted mb-2">If no new users join, how many months will the current balance last?</div>
+        <div class="table-responsive">
+          <table class="table table-sm mb-0">
+            <thead>
+              <tr><th>Period</th><th>Required</th><th>Status</th></tr>
+            </thead>
+            <tbody id="projectionTable"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Advanced / Settings -->
+      <div class="card mt-3 p-3">
+    
+
+        <div class="mb-2">
+          <label class="form-label small-muted">From Block (optional)</label>
+          <input id="fromBlock" type="number" class="form-control" placeholder="e.g., 30000000 (or leave blank)" />
+        </div>
+
+        <input id="tokenDecimals" type="number" class="form-control my-2" value="18" />
+      </div>
+    </div><footer class="text-center small-muted mt-3">.</footer>
+  </div>
+
+<script>
+/*
+  === CONFIGURE BELOW ===
+  Replace these placeholders with your real addresses.
+*/
+const CONTRACT_ADDRESS = "0x614799D80B547EcF0C04496aaa9632FfdE98d1bA";
+const TOKEN_ADDRESS = "0xe36b5223d488322fac2ddda937e5ab226e83fbbd";
+// If you know deployment block, put it in UI or hardcode here.
+const DEFAULT_FROM_BLOCK = 0; // set 0 to scan all (slow). Better to set deployment block.
+
+/*
+  === ABI: minimal pieces we need ===
+  - Staked event (for counting unique stakers)
+  - optionally isAdmin and addAdmin (if present in your contract)
+  - We also call token.balanceOf
+*/
+const CONTRACT_ABI = [
+  "event Staked(address indexed user,uint256 amount,string axId)",
+  "function isAdmin(address) view returns (bool)",
+  "function addAdmin(address _admin) external"
+];
+const TOKEN_ABI = [
+  "function balanceOf(address) view returns (uint256)"
+];
+
+/* Constants from your contract */
+const CLAIM_AMOUNT = 0.4; // tokens per claim
+const TOKEN_DECIMALS_DEFAULT = 18;
+
+/* Global variables */
+let provider, signer, currentAccount;
+let contract, tokenContract;
+
+const connectBtn = document.getElementById('connectBtn');
+const refreshBtn = document.getElementById('refreshBtn');
+const infoBox = document.getElementById('infoBox');
+const dashboard = document.getElementById('dashboard');
+
+connectBtn.onclick = connectWallet;
+refreshBtn.onclick = loadDashboard;
+document.getElementById('addAdminBtn').onclick = addAdminTx;
+
+async function connectWallet(){
+  try {
+    if (!window.ethereum) {
+      alert("Please install MetaMask (or use MetaMask in-app browser on mobile).");
+      return;
+    }
+    provider = new ethers.providers.Web3Provider(window.ethereum, "any"); // ethers v5
+    await provider.send("eth_requestAccounts", []);
+    signer = provider.getSigner();
+    currentAccount = await signer.getAddress();
+
+    contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+    tokenContract = new ethers.Contract(TOKEN_ADDRESS, TOKEN_ABI, provider);
+
+    // network check: optional (we don't force chain, but inform)
+    const network = await provider.getNetwork();
+    showInfo(`Connected: ${currentAccount} — chainId: ${network.chainId}`);
+
+    // Check admin (if isAdmin exists)
+    let isAdmin = false;
+    try {
+      // try-call isAdmin; if contract doesn't have it, this will throw
+      isAdmin = await contract.isAdmin(currentAccount);
+    } catch (e) {
+      // Contract may not implement isAdmin: allow owner to continue but warn
+      console.warn("isAdmin check failed (function missing?)", e);
+      showInfo("Warning: contract does not implement isAdmin/is missing. Dashboard will be usable but admin-restricted actions may fail.");
+      isAdmin = true; // let owner proceed (but adding admin will error if function absent)
+    }
+
+    if (!isAdmin) {
+      alert("You are not registered as Admin in contract. Only admins allowed.");
+      return;
+    }
+
+    // Show dashboard
+    dashboard.style.display = "block";
+    refreshBtn.style.display = "block";
+    connectBtn.style.display = "none";
+
+    // Prefill token decimals input with default
+    document.getElementById('tokenDecimals').value = TOKEN_DECIMALS_DEFAULT;
+
+    // Load data
+    await loadDashboard();
+  } catch (err) {
+    console.error(err);
+    alert("Connect error: " + (err && err.message ? err.message : String(err)));
+  }
+}
+
+function showInfo(txt){
+  infoBox.style.display = "block";
+  infoBox.innerText = txt;
+}
+
+async function loadDashboard(){
+  try {
+    showInfo("Loading data... (this may take a few seconds if scanning events)");
+    // read settings
+    let fromBlockInput = Number(document.getElementById('fromBlock').value || 0);
+    const fromBlock = fromBlockInput > 0 ? fromBlockInput : DEFAULT_FROM_BLOCK;
+    const tokenDecimals = Number(document.getElementById('tokenDecimals').value || TOKEN_DECIMALS_DEFAULT);// 1) Fetch Staked events and count unique users
+    // Use provider.getLogs for speed control
+    const iface = new ethers.utils.Interface(CONTRACT_ABI);
+    const topic = iface.getEventTopic("Staked");
+
+    // get current block to limit range
+    const latestBlock = await provider.getBlockNumber();
+    // Safety: if fromBlock is 0 and chain large, scanning all may be heavy; warn
+    if (fromBlock === 0 && latestBlock > 20000000) {
+      // Big chain — warn user
+      if (!confirm("You didn't set a fromBlock. Scanning whole chain may be slow. Continue?")) {
+        showInfo("Cancelled scanning. Set a reasonable 'From Block' (deployment block) to speed up.");
+        return;
+      }
+    }
+
+    // Fetch logs (may be large)
+    const filter = {
+      address: CONTRACT_ADDRESS,
+      fromBlock: fromBlock,
+      toBlock: latestBlock,
+      topics: [topic]
+    };
+    const logs = await provider.getLogs(filter);
+
+    // parse unique users
+    const usersSet = new Set();
+    for (const l of logs) {
+      const parsed = iface.parseLog(l);
+      // Staked(address user, uint256 amount, string axId)
+      const userAddr = parsed.args.user;
+      usersSet.add(userAddr.toLowerCase());
+    }
+    const totalUsers = usersSet.size;
+
+    // 2) Contract token balance
+    let rawBal = await tokenContract.balanceOf(CONTRACT_ADDRESS);
+    // format
+    const balFormatted = Number(ethers.utils.formatUnits(rawBal, tokenDecimals));
+
+    // 3) Daily liability = totalUsers * CLAIM_AMOUNT
+    const dailyLiability = totalUsers * CLAIM_AMOUNT;
+
+    // 4) Sustainability days = balance / dailyLiability
+    let sustainDays = dailyLiability > 0 ? (balFormatted / dailyLiability) : Infinity;
+
+    // Update UI
+    document.getElementById('totalUsers').innerText = totalUsers;
+    document.getElementById('contractBalance').innerText = balFormatted.toFixed(6) + " AX";
+    document.getElementById('dailyLiability').innerText = dailyLiability.toFixed(4) + " AX / day";
+    document.getElementById('sustainDays').innerText = (sustainDays === Infinity) ? "∞ (no active users)" : Math.floor(sustainDays) + " Days";
+
+    // Projection table: periods in days
+    const periods = [
+      {label: "3 Months", days: 90},
+      {label: "6 Months", days: 180},
+      {label: "9 Months", days: 270},
+      {label: "12 Months", days: 365},
+      {label: "15 Months", days: 450},
+      {label: "18 Months", days: 540}
+    ];
+    const tableBody = document.getElementById('projectionTable');
+    tableBody.innerHTML = "";
+
+    for (const p of periods) {
+      const required = dailyLiability * p.days;
+      const ok = balFormatted >= required;
+      const tr = document.createElement('tr');
+      const tdPeriod = document.createElement('td');
+      tdPeriod.innerText = p.label;
+      const tdReq = document.createElement('td');
+      tdReq.innerText = required.toFixed(4) + " AX";
+      const tdStatus = document.createElement('td');
+      tdStatus.innerHTML = ok ? "<span class='status-ok'>✅ OK</span>" : "<span class='status-bad'>❌ Low</span>";
+      tr.appendChild(tdPeriod);
+      tr.appendChild(tdReq);
+      tr.appendChild(tdStatus);
+      tableBody.appendChild(tr);
+    }
+
+    showInfo("Data loaded. Last block: " + latestBlock);
+  } catch (err) {
+    console.error(err);
+    alert("Load error: " + (err && err.message ? err.message : String(err)));
+    showInfo("Error while loading data. See console.");
+  }
+}
+
+</script>
+</body>
+</html>
